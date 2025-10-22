@@ -61,7 +61,3 @@ See [deployment guide](docs/DEPLOYMENT.md#tag-based-deployment) for rollbacks an
 ~$100-120/month (us-east-1): NAT Gateway ($64) • ECS Fargate ($15) • ALB ($16) • Other ($6)
 
 [Cost optimization →](docs/DEPLOYMENT.md#faq)
-
----
-
-**Senior DevOps Engineer Exercise**
