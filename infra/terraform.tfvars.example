@@ -1,0 +1,28 @@
+# Example Terraform Variables
+# Copy this file to terraform.tfvars and customize as needed
+# DO NOT commit terraform.tfvars to version control
+
+# AWS Region
+aws_region = "us-east-1"
+
+# Project Configuration
+project_name = "rails-api"
+environment  = "production"
+
+# Networking
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+
+# ECS Configuration
+container_port   = 80
+container_cpu    = 256   # 0.25 vCPU
+container_memory = 512   # 512 MB
+desired_count    = 2     # Number of tasks
+
+# Application Configuration
+health_check_path = "/health"
+rails_env         = "production"
+rails_log_level   = "info"
+
+# Container Image (usually set by CI/CD)
+# container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/rails-api-production:latest"

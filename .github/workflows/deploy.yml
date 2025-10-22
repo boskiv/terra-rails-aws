@@ -1,0 +1,286 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0, v1.2.3, etc.
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: rails-api-production
+  ECS_SERVICE: rails-api-production-service
+  ECS_CLUSTER: rails-api-production-cluster
+  ECS_TASK_DEFINITION_FAMILY: rails-api-production
+  CONTAINER_NAME: rails-api
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read    # Required for actions/checkout
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      image-tag: ${{ steps.build-image.outputs.image-tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.ref_name }}  # Use git tag name (e.g., v1.0.0)
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          # Build with version tag
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+
+          # Also tag with commit SHA for traceability
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_SHA
+
+          # Tag as latest
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          # Push all tags
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$COMMIT_SHA
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Image details
+        run: |
+          echo "✅ Image built and pushed successfully!"
+          echo "📦 Image: ${{ steps.build-image.outputs.image }}"
+          echo "🏷️  Tag: ${{ steps.build-image.outputs.image-tag }}"
+
+  terraform:
+    name: Terraform Plan & Apply
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    outputs:
+      alb-dns: ${{ steps.terraform-output.outputs.alb-dns }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ./infra
+        run: terraform init
+
+      - name: Terraform Format Check
+        working-directory: ./infra
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        working-directory: ./infra
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: ./infra
+        env:
+          TF_VAR_container_image: ${{ needs.build-and-push.outputs.image }}
+        run: |
+          terraform plan -out=tfplan \
+            -var="container_image=${{ needs.build-and-push.outputs.image }}"
+
+      - name: Terraform Apply
+        working-directory: ./infra
+        env:
+          TF_VAR_container_image: ${{ needs.build-and-push.outputs.image }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: terraform-output
+        working-directory: ./infra
+        run: |
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          echo "alb-dns=$ALB_DNS" >> $GITHUB_OUTPUT
+          echo "📍 ALB DNS: $ALB_DNS"
+
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [build-and-push, terraform]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current task definition
+        id: get-task-def
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION_FAMILY }} \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
+          echo "✅ Current task definition retrieved"
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deployment details
+        run: |
+          echo "✅ Deployment completed successfully!"
+          echo "🎯 Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "🔧 Service: ${{ env.ECS_SERVICE }}"
+          echo "📦 Image: ${{ needs.build-and-push.outputs.image }}"
+
+  verify:
+    name: Post-Deploy Verification
+    runs-on: ubuntu-latest
+    needs: [deploy, terraform]
+
+    steps:
+      - name: Wait for service to stabilize
+        run: |
+          echo "⏳ Waiting 30 seconds for service to stabilize..."
+          sleep 30
+
+      - name: Health check
+        env:
+          ALB_DNS: ${{ needs.terraform.outputs.alb-dns }}
+        run: |
+          echo "🔍 Checking health endpoint: http://$ALB_DNS/health"
+
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT + 1)) of $MAX_RETRIES..."
+
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/health || echo "000")
+
+            if [ "$RESPONSE" = "200" ]; then
+              echo "✅ Health check passed! Status code: 200"
+              BODY=$(curl -s http://$ALB_DNS/health)
+              echo "📄 Response: $BODY"
+
+              if echo "$BODY" | grep -q '"status":"ok"'; then
+                echo "✅ Health check response is correct: {\"status\":\"ok\"}"
+                exit 0
+              else
+                echo "❌ Health check response is incorrect. Expected: {\"status\":\"ok\"}"
+                exit 1
+              fi
+            else
+              echo "⚠️  Health check failed with status code: $RESPONSE"
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Waiting 15 seconds before retry..."
+                sleep 15
+              fi
+            fi
+          done
+
+          echo "❌ Health check failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "🎉 Deployment verified successfully!"
+          echo "🌐 Application URL: http://${{ needs.terraform.outputs.alb-dns }}"
+          echo "❤️  Health Check: http://${{ needs.terraform.outputs.alb-dns }}/health"
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [build-and-push, terraform, deploy, verify]
+    if: always()
+
+    steps:
+      - name: Generate GitHub Actions Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.verify.result }}" = "success" ]; then
+            echo "✅ **Status:** Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Status:** Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ needs.build-and-push.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **ALB DNS:** ${{ needs.terraform.outputs.alb-dns }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Health Check:** http://${{ needs.terraform.outputs.alb-dns }}/health" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "- Build & Push: ${{ needs.build-and-push.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Terraform: ${{ needs.terraform.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy: ${{ needs.deploy.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify: ${{ needs.verify.result }}" >> $GITHUB_STEP_SUMMARY
+
+      # Optional: Add Slack notification
+      # - name: Send Slack notification
+      #   if: always()
+      #   uses: slackapi/slack-github-action@v1
+      #   with:
+      #     payload: |
+      #       {
+      #         "text": "Deployment ${{ needs.verify.result == 'success' && 'succeeded' || 'failed' }}",
+      #         "blocks": [
+      #           {
+      #             "type": "section",
+      #             "text": {
+      #               "type": "mrkdwn",
+      #               "text": "${{ needs.verify.result == 'success' && '✅' || '❌' }} *Deployment ${{ needs.verify.result == 'success' && 'Successful' || 'Failed' }}*\n*Commit:* ${{ github.sha }}\n*URL:* http://${{ needs.terraform.outputs.alb-dns }}"
+      #             }
+      #           }
+      #         ]
+      #       }
+      #   env:
+      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
